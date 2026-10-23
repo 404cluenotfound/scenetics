@@ -3,7 +3,7 @@
 **Scenes + Kinetics — scenes that move.**
 Canva for frontend developers: drag, drop, and scroll-animate a landing page visually, then export real, clean React + Tailwind code.
 
-> MVP / test version (v0.2). Landing pages only.
+> MVP / test version (v0.3). Landing pages only.
 
 ## The idea
 
@@ -88,7 +88,7 @@ if the server is not running.
 
 ```bash
 cd client
-npm test             # codegen constraint tests (plain Node, no framework)
+npm test             # codegen constraint tests + importer tests (plain Node, no framework)
 npm run build        # type-check + production build
 ```
 
@@ -136,6 +136,18 @@ export; scenes saved by v0.1 are auto-migrated with defaults on load)
 - **Text tools**: font family, bold / italic / underline, text alignment, line height, letter spacing — stored in the model and exported inline
 - **Style tools**: border width + colour, box-shadow presets (none/sm/md/lg), on top of the existing radius/opacity
 - **Canvas zoom** (50–150%, view-only) and a **snap-to-grid** toggle (drag/resize snap to whole %)
+
+**New in v0.3 — Import an existing landing page** (header **⇩ Import** button).
+Import converts existing code into *native* Scenetics elements — after import,
+every v0.2 tool, scroll keyframes and the code export work on the imported
+elements exactly like hand-built ones.
+- **Three inputs**: paste HTML or React JSX · upload a single `.html` / `.jsx` / `.tsx` file · upload a whole **folder** (or a **.zip**, read by a small built-in unzip — stored + deflate, no new dependencies). For folders/zips the entry page is picked automatically (`index.html` first, else the first `.html`, else the main page component; a React shell `index.html` falls through to its page component), sibling `.css` files are applied, and local images are embedded as data URLs so they resolve
+- **How it works**: the markup renders in a hidden, sandboxed iframe at 1280px width; the rendered DOM is walked and every meaningful element is measured (bounding rect relative to the page root + computed styles). Rects convert through the same anchor + % model as everything else — imported elements anchor *top-left* at their measured % position, sizes are % of the rendered page, and font sizes are scaled by stage/render width so text stays proportional. Background-bearing containers become cards *behind* their converted children; headings, text, buttons/links and images map to their native types; computed colour, background, font size/weight/style, alignment, radius, opacity, font family and line height map to model fields (`client/src/lib/importer.js` holds the pure, unit-tested half; the iframe measurement half lives in `App.tsx`)
+- **Page height**: the stage represents the *full* imported page — positions and sizes are % of the whole rendered page height, so a long page's layout proportions hold inside the one Scene viewport (scroll *animation* length stays the separate Scene `scrollLengthVh` property)
+- Tailwind utility classes in imported markup are honoured: the Tailwind Play CDN is injected into the sandbox and given a bounded moment to process before measuring. If it can't load (offline), import continues with inline/computed styles only
+- After converting you choose **Replace current page** or **Add to current page**; all imported elements are selected, a summary reports how many were imported and how many were skipped — and **one Ctrl+Z undoes the entire import** (it is a single scene snapshot)
+
+  **Import limits (honest)**: at most **60 elements** per import (truncation is reported). Scripts, SVG, canvas, video and iframes can't become native elements and are skipped (counted, never fatal — malformed input shows a friendly message and changes nothing). JSX support is pragmatic preprocessing, not a real parser: static markup converts well; `style={{…}}` objects, `className`, `{"string"}` expressions and self-closing tags are handled, but data-driven JSX (`.map()` lists, props, hooks, imported components) cannot be resolved and those pieces are dropped. Text-ish elements import with *auto* height (cards/images keep their measured height) so text can't clip when the stage width differs from the source page. Background *images* and gradients don't map to model fields (solid background colours do). Imported text is flattened per element — rich inline formatting inside a paragraph (mixed bold/links) becomes one element with one style. Folder/zip files over 4 MB each are ignored.
 
 **TODO / stubbed (labelled honestly)**
 - Google login: routes exist, return 501 until OAuth credentials + code exchange are implemented; no per-user ownership enforcement on projects yet (auth middleware slot is ready in the projects router)
