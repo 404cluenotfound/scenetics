@@ -7,11 +7,11 @@ export function uid(prefix = 'el'): string {
 }
 
 const DEFAULTS: Record<ElementType, Partial<SceneElement>> = {
-  heading: { text: 'Big Heading', color: '#ffffff', bg: '#7c3aed', fontSize: 40, radius: 0, widthPercent: 60 },
-  text: { text: 'Some supporting text goes here.', color: '#e5e5e5', bg: '#262626', fontSize: 16, radius: 0, widthPercent: 45 },
-  button: { text: 'Get Started', color: '#ffffff', bg: '#7c3aed', fontSize: 16, radius: 999, widthPercent: 22 },
-  card: { text: 'Card title — edit me', color: '#f5f5f5', bg: '#1f1f23', fontSize: 18, radius: 16, widthPercent: 28 },
-  image: { text: 'Image', color: '#a78bfa', bg: '#2e1065', fontSize: 14, radius: 12, widthPercent: 30 },
+  heading: { text: 'Big Heading', color: '#ffffff', bg: '#7c3aed', fontSize: 40, radius: 0, widthPercent: 60, bold: true, textAlign: 'center', lineHeight: 1.25 },
+  text: { text: 'Some supporting text goes here.', color: '#e5e5e5', bg: '#262626', fontSize: 16, radius: 0, widthPercent: 45, textAlign: 'center', lineHeight: 1.625 },
+  button: { text: 'Get Started', color: '#ffffff', bg: '#7c3aed', fontSize: 16, radius: 999, widthPercent: 22, bold: true, textAlign: 'center' },
+  card: { text: 'Card title — edit me', color: '#f5f5f5', bg: '#1f1f23', fontSize: 18, radius: 16, widthPercent: 28, shadow: 'lg', textAlign: 'left' },
+  image: { text: 'Image', color: '#a78bfa', bg: '#2e1065', fontSize: 14, radius: 12, widthPercent: 30, textAlign: 'center' },
 };
 
 export function createElement(
@@ -29,11 +29,69 @@ export function createElement(
     radius: d.radius ?? 0,
     opacity: 1,
     widthPercent: d.widthPercent ?? 30,
+    heightPercent: null,
     anchor: 'center',
     xPercent: 50,
     yPercent: 50,
     tracks: {},
+    // v0.2 editor-tool fields (defaults keep old scenes / AI output valid)
+    baseRotate: 0,
+    flipH: false,
+    flipV: false,
+    cropX: 50,
+    cropY: 50,
+    cropZoom: 1,
+    imageSrc: '',
+    locked: false,
+    groupId: null,
+    fontFamily: 'inherit',
+    bold: d.bold ?? false,
+    italic: false,
+    underline: false,
+    textAlign: d.textAlign ?? 'left',
+    lineHeight: d.lineHeight ?? 1.4,
+    letterSpacing: 0,
+    borderWidth: 0,
+    borderColor: '#ffffff',
+    shadow: d.shadow ?? 'none',
     ...overrides,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Migration — scenes saved before v0.2 (localStorage) lack the new    */
+/* fields. Fill defaults underneath whatever the saved scene has so    */
+/* nothing crashes and old projects keep working unchanged.            */
+/* ------------------------------------------------------------------ */
+
+export function migrateElement(raw: unknown): SceneElement | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const type = VALID_TYPES.includes(r.type as ElementType) ? (r.type as ElementType) : 'card';
+  const base = createElement(type);
+  const merged = { ...base, ...(r as Partial<SceneElement>) };
+  if (!VALID_ANCHORS.includes(merged.anchor)) merged.anchor = 'center';
+  if (!merged.tracks || typeof merged.tracks !== 'object') merged.tracks = {};
+  if (typeof merged.heightPercent !== 'number') merged.heightPercent = null;
+  if (typeof merged.baseRotate !== 'number') merged.baseRotate = 0;
+  if (typeof merged.cropX !== 'number') merged.cropX = 50;
+  if (typeof merged.cropY !== 'number') merged.cropY = 50;
+  if (typeof merged.cropZoom !== 'number') merged.cropZoom = 1;
+  return merged;
+}
+
+export function migrateScene(raw: unknown): Scene | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  if (!Array.isArray(r.elements)) return null;
+  const elements = r.elements
+    .map((e) => migrateElement(e))
+    .filter((e): e is SceneElement => e !== null);
+  return {
+    id: typeof r.id === 'string' ? r.id : uid('scene'),
+    name: typeof r.name === 'string' ? r.name : 'My Landing Page',
+    scrollLengthVh: typeof r.scrollLengthVh === 'number' ? r.scrollLengthVh : 300,
+    elements,
   };
 }
 

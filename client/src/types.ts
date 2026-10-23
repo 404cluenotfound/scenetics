@@ -28,6 +28,9 @@ export interface MotionState {
   opacity: number;
 }
 
+export type TextAlign = 'left' | 'center' | 'right';
+export type ShadowPreset = 'none' | 'sm' | 'md' | 'lg';
+
 export interface SceneElement {
   id: string;
   type: ElementType;
@@ -38,10 +41,40 @@ export interface SceneElement {
   radius: number; // px border radius
   opacity: number; // base opacity (used when the element has no keyframes)
   widthPercent: number; // % of stage width
+  /** % of stage height; null = auto (content height; images keep 4/3 aspect). */
+  heightPercent: number | null;
   anchor: Anchor;
   xPercent: number; // anchor point position, % of stage width
   yPercent: number; // anchor point position, % of stage height
   tracks: Tracks;
+  /* ---- v0.2 editor tools ---- */
+  /** Base rotation in degrees. Merged INTO the rotate keyframe track on
+      export (constraint 3) and preview, never a competing transform. */
+  baseRotate: number;
+  /** Flip flags — merged into the scale keyframe track / standalone scale. */
+  flipH: boolean;
+  flipV: boolean;
+  /** Image crop (images only): object-position % and inner-image zoom. */
+  cropX: number;
+  cropY: number;
+  cropZoom: number;
+  /** Optional image URL; empty = generated placeholder. */
+  imageSrc: string;
+  locked: boolean;
+  /** Elements sharing a groupId select/move together (export stays flat). */
+  groupId: string | null;
+  /* Text tools */
+  fontFamily: string; // 'inherit' or a font-family name string
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  textAlign: TextAlign;
+  lineHeight: number; // unitless multiplier
+  letterSpacing: number; // px
+  /* Style tools */
+  borderWidth: number; // px, 0 = no border
+  borderColor: string;
+  shadow: ShadowPreset;
 }
 
 export interface Scene {

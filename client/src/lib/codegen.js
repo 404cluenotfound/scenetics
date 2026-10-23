@@ -81,17 +81,52 @@ export function collectOffsets(element) {
 }
 
 /**
- * The merged state of an element at one scroll offset: every animatable
- * property sampled at that offset (constraint 3 — this is the merge step
- * shared by the editor preview AND the exporter, so they can never drift).
+ * The raw track state of an element at one scroll offset: every animatable
+ * property sampled from its keyframe track only (no base offsets applied).
+ * The Motion panel edits values in this track space.
  */
-export function sampleElementAt(element, offset) {
+export function sampleTracksAt(element, offset) {
   const tracks = element.tracks || {};
   const out = {};
   for (const prop of TRACK_PROPS) {
     out[prop] = sampleTrack(tracks[prop], offset, TRACK_DEFAULTS[prop]);
   }
   return out;
+}
+
+/**
+ * The merged state of an element at one scroll offset (constraint 3 — this
+ * is the merge step shared by the editor preview AND the exporter, so they
+ * can never drift). On top of the raw tracks it folds in the element's
+ * static tool settings, so there is still exactly ONE source per property:
+ *  - baseRotate is ADDED to the rotate track value;
+ *  - flipH / flipV MULTIPLY the scale track value per axis (scaleX/scaleY).
+ */
+export function sampleElementAt(element, offset) {
+  const t = sampleTracksAt(element, offset);
+  const flipX = element.flipH ? -1 : 1;
+  const flipY = element.flipV ? -1 : 1;
+  return {
+    translateX: t.translateX,
+    translateY: t.translateY,
+    scale: t.scale,
+    scaleX: t.scale * flipX,
+    scaleY: t.scale * flipY,
+    rotate: t.rotate + (element.baseRotate || 0),
+    opacity: t.opacity,
+  };
+}
+
+/** Box-shadow presets shared by the exporter and the editor preview. */
+export const SHADOWS = {
+  sm: '0 1px 2px rgba(0, 0, 0, 0.25)',
+  md: '0 4px 12px rgba(0, 0, 0, 0.35)',
+  lg: '0 10px 30px rgba(0, 0, 0, 0.45)',
+};
+
+/** Placeholder image used when the user has not set an image URL. */
+export function placeholderImageSrc(element) {
+  return `https://picsum.photos/seed/scenetics-${classSuffix(element.id)}/800/600`;
 }
 
 /** Round to 3 decimals and trim, for stable generated output. */
@@ -122,13 +157,15 @@ const TAG_BY_TYPE = {
   image: 'figure',
 };
 
-/** A few presentational Tailwind classes per type (padding etc.). */
+/** A few presentational Tailwind classes per type (padding etc.).
+    Shadow is NOT here any more: it is model-driven (v0.2 shadow presets,
+    emitted as inline boxShadow) so the "none" preset really means none. */
 const TAILWIND_BY_TYPE = {
   heading: 'font-bold leading-tight m-0',
   text: 'leading-relaxed m-0',
   button: 'px-5 py-2.5 font-semibold cursor-pointer border-0',
-  card: 'p-5 shadow-lg',
-  image: 'flex items-center justify-center m-0 overflow-hidden',
+  card: 'p-5',
+  image: 'm-0 overflow-hidden',
 };
 
 /**
@@ -161,10 +198,56 @@ export function generatePageJsx(scene) {
     if (el.type === 'card' || el.type === 'button' || el.type === 'image') {
       styleParts.push(`borderRadius: '${n(el.radius)}px'`);
     }
+    // v0.2 text tools — emitted only when the field is present, so raw /
+    // pre-v0.2 element objects still generate the v0.1 output.
+    if (el.fontFamily && el.fontFamily !== 'inherit') {
+      styleParts.push(`fontFamily: '${String(el.fontFamily).replace(/'/g, '')}'`);
+    }
+    if (typeof el.bold === 'boolean') styleParts.push(`fontWeight: ${el.bold ? 700 : 400}`);
+    if (el.italic) styleParts.push(`fontStyle: 'italic'`);
+    if (el.underline) styleParts.push(`textDecoration: 'underline'`);
+    if (el.textAlign) styleParts.push(`textAlign: '${el.textAlign}'`);
+    if (typeof el.lineHeight === 'number') styleParts.push(`lineHeight: ${n(el.lineHeight)}`);
+    if (typeof el.letterSpacing === 'number' && el.letterSpacing !== 0) {
+      styleParts.push(`letterSpacing: '${n(el.letterSpacing)}px'`);
+    }
+    // v0.2 style tools: border + shadow presets.
+    if (typeof el.borderWidth === 'number' && el.borderWidth > 0) {
+      styleParts.push(`border: '${n(el.borderWidth)}px solid ${el.borderColor || '#ffffff'}'`);
+    }
+    if (el.shadow && SHADOWS[el.shadow]) {
+      styleParts.push(`boxShadow: '${SHADOWS[el.shadow]}'`);
+    }
     const hasTracks = collectOffsets(el).length > 0;
     if (!hasTracks) styleParts.push(`opacity: ${n(el.opacity)}`);
     const tw = TAILWIND_BY_TYPE[el.type] || '';
-    const text = el.type === 'image' ? 'Image' : escapeJsxText(el.text);
+    if (el.type === 'image') {
+      // Crop (v0.2): the <figure> is an overflow-hidden frame (sized by the
+      // .el- class: width %, height % or 4/3 aspect); the <img> fills it
+      // with object-fit: cover, object-position picks the crop window and
+      // the crop zoom scales the image INSIDE the frame. The editor preview
+      // uses the exact same CSS, so preview and export match.
+      const src = el.imageSrc
+        ? String(el.imageSrc).replace(/"/g, '%22')
+        : placeholderImageSrc(el);
+      const imgStyle = [
+        `width: '100%'`,
+        `height: '100%'`,
+        `display: 'block'`,
+        `objectFit: 'cover'`,
+        `objectPosition: '${n(el.cropX ?? 50)}% ${n(el.cropY ?? 50)}%'`,
+        `transform: 'scale(${n(el.cropZoom ?? 1)})'`,
+      ].join(', ');
+      lines.push(
+        `          <figure className="${cls} ${tw}" style={{ ${styleParts.join(', ')} }}>`
+      );
+      lines.push(
+        `            <img src="${src}" alt="${escapeJsxText(el.text)}" style={{ ${imgStyle} }} />`
+      );
+      lines.push('          </figure>');
+      continue;
+    }
+    const text = escapeJsxText(el.text);
     lines.push(
       `          <${tag} className="${cls} ${tw}" style={{ ${styleParts.join(', ')} }}>${text}</${tag}>`
     );
@@ -209,14 +292,32 @@ export function generateAnimationsCss(scene) {
     out.push(`  left: ${n(el.xPercent)}%;`);
     out.push(`  top: ${n(el.yPercent)}%;`);
     out.push(`  width: ${n(el.widthPercent)}%;`);
-    if (el.type === 'image') out.push('  aspect-ratio: 4 / 3;');
-    if (el.type === 'card') out.push('  min-height: 18%;');
+    // Height (v0.2): explicit height exports as % of the stage height
+    // (constraint 1 — still no px). Without one, images keep their 4/3
+    // frame aspect and cards a minimum height, as in v0.1.
+    if (typeof el.heightPercent === 'number') {
+      out.push(`  height: ${n(el.heightPercent)}%;`);
+    } else if (el.type === 'image') {
+      out.push('  aspect-ratio: 4 / 3;');
+    } else if (el.type === 'card') {
+      out.push('  min-height: 18%;');
+    }
+    if (el.type === 'image') out.push('  overflow: hidden; /* crop frame */');
     // Static anchor alignment only. Animated motion below uses the standalone
     // translate/rotate/scale properties, which compose with this transform.
     out.push(`  transform: translate(${x}%, ${y}%);`);
-    out.push('}');
-
     const offsets = collectOffsets(el);
+    if (offsets.length === 0) {
+      // No keyframes: base rotation / flip export as the SAME standalone
+      // properties the keyframes would use (constraint 3 — one source).
+      // When keyframes exist they carry the merged values instead, so
+      // these are deliberately NOT emitted here in that case.
+      if (el.baseRotate) out.push(`  rotate: ${n(el.baseRotate)}deg;`);
+      const fx = el.flipH ? -1 : 1;
+      const fy = el.flipV ? -1 : 1;
+      if (fx !== 1 || fy !== 1) out.push(`  scale: ${fx} ${fy};`);
+    }
+    out.push('}');
     if (offsets.length > 0) {
       const animName = `kf-${classSuffix(el.id)}`;
       out.push('');
@@ -226,8 +327,14 @@ export function generateAnimationsCss(scene) {
         const s = sampleElementAt(el, offset);
         out.push(`  ${n(offset)}% {`);
         out.push(`    translate: ${n(s.translateX)}px ${n(s.translateY)}px;`);
+        // sampleElementAt already merged baseRotate into rotate and the
+        // flip flags into scaleX/scaleY (constraint 3 — merged, not layered).
         out.push(`    rotate: ${n(s.rotate)}deg;`);
-        out.push(`    scale: ${n(s.scale)};`);
+        out.push(
+          s.scaleX === s.scaleY
+            ? `    scale: ${n(s.scaleX)};`
+            : `    scale: ${n(s.scaleX)} ${n(s.scaleY)};`
+        );
         out.push(`    opacity: ${n(s.opacity)};`);
         out.push('  }');
       }
