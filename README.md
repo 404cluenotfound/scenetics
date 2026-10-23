@@ -3,7 +3,7 @@
 **Scenes + Kinetics — scenes that move.**
 Canva for frontend developers: drag, drop, and scroll-animate a landing page visually, then export real, clean React + Tailwind code.
 
-> MVP / test version. Landing pages only.
+> MVP / test version (v0.2). Landing pages only.
 
 ## The idea
 
@@ -120,6 +120,22 @@ npm run build        # type-check + production build
 - Dark **and** light themes (purple accent), persisted
 - Save/load to localStorage + server save when reachable
 - AI panel: Grok via server, with a working local fallback generator
+
+**New in v0.2 — Canva-style editor tools** (everything flows through the same
+scene JSON → codegen path, so every tool updates the live code panel and the
+export; scenes saved by v0.1 are auto-migrated with defaults on load)
+- **Resize**: 8 drag handles (corners + edges) on the selected element, aspect-ratio lock toggle ("Lock ratio" in the canvas toolbar), numeric Width % / Height % / X % / Y % inputs. Height is a first-class model field, exported as % of stage height (still no px positioning)
+- **Rotate handle** above the selection + numeric Rotate field. The base rotation is *merged into* the rotate keyframe track on export (keyframe value = track + base) and exported as a standalone `rotate:` property when the element has no keyframes — never a second competing transform (constraint 3). Shift while rotating snaps to 15°
+- **Image crop**: images render in an overflow-hidden frame with `object-fit: cover`; the Crop section sets the crop window (Position X/Y sliders → `object-position`) and the zoom of the image inside the frame, plus an optional image URL (blank = placeholder). Editor preview and export use identical CSS
+- **Flip horizontal / vertical**: merged into the scale keyframe track per axis (`scaleX`/`scaleY`) or a standalone `scale:` when there are no keyframes
+- **Duplicate / copy / paste / delete** buttons + shortcuts (Ctrl/⌘+D, Ctrl/⌘+C, Ctrl/⌘+V, Delete; arrow keys nudge 1%, Shift+arrows 5%)
+- **Undo / redo**: scene-snapshot history (cap 50) with toolbar buttons and Ctrl/⌘+Z / Ctrl/⌘+Shift+Z
+- **Layers panel**: z-order = element order; click to select (grouped elements select together), per-element lock toggle, and Bring to front / Forward / Backward / Send to back. Locked elements can't be dragged or clicked on stage, only selected here
+- **Align & distribute**: align the selection to the stage (single element) or to each other (multi-select) — left/center/right/top/middle/bottom, solved through the anchor model; distribute horizontally/vertically for 3+ selected
+- **Multi-select & grouping**: Shift+click toggles selection, dragging any selected element moves them all, Group/Ungroup via `groupId` (groups are editor-only — export stays flat and semantic, no wrapper divs)
+- **Text tools**: font family, bold / italic / underline, text alignment, line height, letter spacing — stored in the model and exported inline
+- **Style tools**: border width + colour, box-shadow presets (none/sm/md/lg), on top of the existing radius/opacity
+- **Canvas zoom** (50–150%, view-only) and a **snap-to-grid** toggle (drag/resize snap to whole %)
 
 **TODO / stubbed (labelled honestly)**
 - Google login: routes exist, return 501 until OAuth credentials + code exchange are implemented; no per-user ownership enforcement on projects yet (auth middleware slot is ready in the projects router)
