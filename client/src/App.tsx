@@ -12,6 +12,17 @@ import {
   TRACK_DEFAULTS,
 } from './lib/codegen.js';
 import { createDefaultScene, createElement, FRAMES, localGenerate, migrateScene, normaliseElements, uid } from './lib/model';
+import {
+  candidatesToSpecs,
+  colorToHex,
+  detectFormat,
+  IMPORT_CAP,
+  jsxToHtml,
+  pickEntryFile,
+  readZipEntries,
+  resolveAssetSrc,
+} from './lib/importer.js';
+import type { ImportCandidate } from './lib/importer.js';
 
 const API = (import.meta as any).env?.VITE_API_URL || 'http://localhost:4000';
 const LS_SCENE = 'scenetics-scene';
@@ -56,6 +67,143 @@ const clampPct = (v: number) => Math.min(100, Math.max(0, v));
 const r1 = (v: number) => Math.round(v * 10) / 10;
 const esc = (s: string) => ((window as any).CSS?.escape ? (window as any).CSS.escape(s) : s);
 
+/* ================================================================== */
+/* v0.3 Import — the DOM half of the pipeline.                          */
+/* Imported markup renders in a hidden, sandboxed iframe at a fixed     */
+/* desktop width; we measure the rendered DOM (bounding rects relative  */
+/* to the page root + computed styles) into plain ImportCandidate       */
+/* objects, and the PURE mapping in lib/importer.js turns those into    */
+/* native scene elements. Editor-only: nothing here reaches exports.    */
+/* ================================================================== */
+
+const IMPORT_RENDER_WIDTH = 1280;
+const IMPORT_SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'LINK', 'META', 'TITLE', 'HEAD', 'NOSCRIPT', 'TEMPLATE', 'BR', 'WBR']);
+
+function hasTailwindClasses(markup: string): boolean {
+  const joined = (markup.match(/class(?:Name)?\s*=\s*"[^"]*"/g) || []).join(' ');
+  return /\b(flex|grid|items-|justify-|content-|text-|bg-|p[trblxy]?-|m[trblxy]?-|w-|h-|min-h|rounded|font-|gap-|border|shadow|leading-|tracking-|uppercase|object-|overflow-|relative|absolute|fixed|inset-|top-|left-|z-)/.test(joined);
+}
+
+function buildImportDocument(markup: string, cssTexts: string[], useTailwind: boolean): string {
+  const tailwind = useTailwind ? '<script src="https://cdn.tailwindcss.com"></script>' : '';
+  const styles = cssTexts.map((t) => `<style>${t.replace(/<\/style/gi, '<\\/style')}</style>`).join('');
+  if (/<!doctype|<html[\s>]/i.test(markup)) {
+    if (/<\/head>/i.test(markup)) return markup.replace(/<\/head>/i, `${tailwind}${styles}</head>`);
+    return markup.replace(/<body/i, `${tailwind}${styles}<body`);
+  }
+  return `<!doctype html><html><head><meta charset="utf-8">${tailwind}${styles}</head><body>${markup}</body></html>`;
+}
+
+function extractCandidatesFromDoc(
+  doc: Document,
+  win: Window
+): { candidates: ImportCandidate[]; skipped: number; pageWidth: number; pageHeight: number } {
+  const candidates: ImportCandidate[] = [];
+  let skipped = 0;
+  let visited = 0;
+  const docEl = doc.documentElement;
+  const pageWidth = Math.max(docEl.scrollWidth || 0, doc.body?.scrollWidth || 0, IMPORT_RENDER_WIDTH);
+  const pageHeight = Math.max(docEl.scrollHeight || 0, doc.body?.scrollHeight || 0, 1);
+  const rootRect = docEl.getBoundingClientRect();
+
+  const directText = (el: Element) =>
+    Array.from(el.childNodes)
+      .filter((n) => n.nodeType === 3)
+      .map((n) => n.textContent || '')
+      .join(' ');
+  const allLeaves = (el: Element) => Array.from(el.children).every((ch) => ch.children.length === 0);
+
+  const visit = (el: Element) => {
+    if (visited++ > 4000) return;
+    const tag = el.tagName;
+    if (IMPORT_SKIP_TAGS.has(tag)) return;
+    const cs = win.getComputedStyle(el);
+    const r = el.getBoundingClientRect();
+    const rect = { left: r.left - rootRect.left, top: r.top - rootRect.top, width: r.width, height: r.height };
+    const meaningfulSize = r.width >= 2 && r.height >= 2;
+
+    if (tag === 'SVG' || tag === 'IFRAME' || tag === 'VIDEO' || tag === 'CANVAS') {
+      if (meaningfulSize) skipped += 1; // cannot become a native element (v1)
+      return;
+    }
+    if (cs.display === 'none' || cs.visibility === 'hidden') {
+      if (meaningfulSize && ((el.textContent || '').trim() || tag === 'IMG')) skipped += 1;
+      return;
+    }
+
+    const styleOf = (): ImportCandidate['style'] => ({
+      color: cs.color,
+      backgroundColor: cs.backgroundColor,
+      fontSizePx: parseFloat(cs.fontSize) || undefined,
+      fontWeight: cs.fontWeight,
+      fontStyle: cs.fontStyle,
+      textAlign: cs.textAlign,
+      borderRadius: cs.borderTopLeftRadius,
+      opacity: parseFloat(cs.opacity),
+      fontFamily: cs.fontFamily,
+      lineHeightPx: parseFloat(cs.lineHeight) || undefined,
+    });
+
+    if (tag === 'IMG') {
+      const img = el as HTMLImageElement;
+      if (meaningfulSize) {
+        candidates.push({ tag: 'img', text: img.alt || '', src: img.currentSrc || img.src || '', rect, style: styleOf() });
+      } else skipped += 1;
+      return;
+    }
+
+    const kids = Array.from(el.children).filter((ch) => !IMPORT_SKIP_TAGS.has(ch.tagName));
+    const ownText = directText(el).replace(/\s+/g, ' ').trim();
+    const fullText = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    const hasBgImage = !!cs.backgroundImage && cs.backgroundImage !== 'none';
+    const bgVisible = colorToHex(cs.backgroundColor) !== null || hasBgImage;
+
+    if (kids.length === 0) {
+      if (fullText) candidates.push({ tag: tag.toLowerCase(), text: fullText, rect, style: styleOf() });
+      return;
+    }
+    if (allLeaves(el) && fullText) {
+      // e.g. <h1>Hello <span>world</span></h1> — one element, not fragments.
+      candidates.push({ tag: tag.toLowerCase(), text: fullText, rect, style: styleOf() });
+      return;
+    }
+    // Container with a real background: keep it as a card behind its
+    // children (z-order = push order), then still convert the children.
+    if (bgVisible && rect.width * rect.height > pageWidth * pageHeight * 0.004) {
+      candidates.push({ tag: tag.toLowerCase(), text: ownText, container: true, hasBgImage, rect, style: styleOf() });
+    } else if (bgVisible && ownText) {
+      candidates.push({ tag: tag.toLowerCase(), text: ownText, rect, style: styleOf() });
+    }
+    for (const ch of Array.from(el.children)) visit(ch);
+  };
+
+  if (doc.body) for (const ch of Array.from(doc.body.children)) visit(ch);
+  return { candidates, skipped, pageWidth, pageHeight };
+}
+
+const IMAGE_MIME: Record<string, string> = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  webp: 'image/webp', svg: 'image/svg+xml', avif: 'image/avif', ico: 'image/x-icon',
+};
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let s = '';
+  const CH = 0x8000;
+  for (let i = 0; i < bytes.length; i += CH) {
+    s += String.fromCharCode(...bytes.subarray(i, i + CH));
+  }
+  return btoa(s);
+}
+
+function fileToDataUrl(f: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(f);
+  });
+}
+
 export default function App() {
   const [scene, setScene] = useState<Scene>(() => {
     try {
@@ -80,6 +228,20 @@ export default function App() {
   const [lockRatio, setLockRatio] = useState(false);
   const stageRef = useRef<HTMLDivElement>(null);
   const clipboardRef = useRef<SceneElement[]>([]);
+
+  /* ---------------- v0.3 import state ---------------- */
+  const [showImport, setShowImport] = useState(false);
+  const [importText, setImportText] = useState('');
+  const [importBusy, setImportBusy] = useState(false);
+  const [importNote, setImportNote] = useState('');
+  const [importSourceLabel, setImportSourceLabel] = useState('');
+  const bundleRef = useRef<{
+    label: string;
+    entry: string;
+    format: 'html' | 'jsx';
+    assets: Record<string, string>;
+    cssTexts: string[];
+  } | null>(null);
 
   const primary: SceneElement | null =
     scene.elements.find((e) => e.id === selectedIds[selectedIds.length - 1]) || null;
@@ -672,6 +834,237 @@ export default function App() {
     } catch { setStatus('Local save was corrupted — keeping current scene.'); }
   };
 
+  /* ---------------- v0.3 import: source loading ---------------- */
+  type BundleItem = { name: string; text?: string; dataUrl?: string };
+
+  const buildBundle = async (items: BundleItem[], label: string) => {
+    const names = items.map((i) => i.name);
+    const byName = new Map(items.map((i) => [i.name, i]));
+    let entryName = pickEntryFile(names);
+    if (!entryName) {
+      setImportNote('No entry page found — the upload needs an index.html / .html page or a main page component (.jsx/.tsx).');
+      return;
+    }
+    let entryItem = byName.get(entryName);
+    let format = detectFormat(entryItem?.text || '', entryName);
+    // React shell case: index.html is just <div id="root"> + a module
+    // script — the real markup lives in the page component. Prefer it.
+    if (format === 'html') {
+      const visibleText = (entryItem?.text || '').replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<[^>]+>/g, '').trim();
+      if (visibleText.length < 20 && /id\s*=\s*["']root["']/.test(entryItem?.text || '')) {
+        const comp = items.find(
+          (i) => /\.(jsx|tsx)$/i.test(i.name) && !/main\.(jsx|tsx)$/i.test(i.name) && typeof i.text === 'string'
+        );
+        if (comp) {
+          entryName = comp.name;
+          entryItem = comp;
+          format = 'jsx';
+        }
+      }
+    }
+    if (!entryItem || typeof entryItem.text !== 'string') {
+      setImportNote(`Could not read the entry file (${entryName}).`);
+      return;
+    }
+    const assets: Record<string, string> = {};
+    for (const i of items) if (i.dataUrl) assets[i.name] = i.dataUrl;
+    const cssTexts = items
+      .filter((i) => /\.css$/i.test(i.name) && typeof i.text === 'string')
+      .map((i) => (i.text as string).slice(0, 120000));
+    bundleRef.current = { label, entry: entryItem.text, format, assets, cssTexts };
+    setImportText(entryItem.text);
+    setImportSourceLabel(`${label} — entry: ${entryName}`);
+    setImportNote(
+      `Loaded ${label}: entry ${entryName}, ${cssTexts.length} stylesheet(s), ${Object.keys(assets).length} image(s). Now choose replace or add below.`
+    );
+  };
+
+  const onImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    e.target.value = '';
+    if (!f) return;
+    try {
+      const text = await f.text();
+      bundleRef.current = null;
+      setImportText(text);
+      setImportSourceLabel(`File: ${f.name}`);
+      setImportNote(`Loaded ${f.name}. Now choose replace or add below.`);
+    } catch {
+      setImportNote('Could not read that file.');
+    }
+  };
+
+  const onImportZip = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    e.target.value = '';
+    if (!f) return;
+    setImportNote('Reading zip…');
+    try {
+      const raw = await readZipEntries(new Uint8Array(await f.arrayBuffer()));
+      const decoder = new TextDecoder();
+      const items: BundleItem[] = [];
+      for (const entry of raw) {
+        if (entry.data.length > 4_000_000) continue;
+        const ext = entry.name.toLowerCase().split('.').pop() || '';
+        if (['html', 'htm', 'css', 'jsx', 'tsx'].includes(ext)) {
+          items.push({ name: entry.name, text: decoder.decode(entry.data) });
+        } else if (IMAGE_MIME[ext]) {
+          items.push({ name: entry.name, dataUrl: `data:${IMAGE_MIME[ext]};base64,${bytesToBase64(entry.data)}` });
+        }
+      }
+      await buildBundle(items, `Zip: ${f.name}`);
+    } catch (err) {
+      setImportNote(err instanceof Error ? err.message : 'Could not read that zip file.');
+    }
+  };
+
+  const onImportFolder = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = '';
+    if (files.length === 0) return;
+    setImportNote('Reading folder…');
+    try {
+      const items: BundleItem[] = [];
+      for (const f of files) {
+        if (f.size > 4_000_000) continue;
+        const rel = f.webkitRelativePath ? f.webkitRelativePath.split('/').slice(1).join('/') || f.name : f.name;
+        const ext = f.name.toLowerCase().split('.').pop() || '';
+        if (['html', 'htm', 'css', 'jsx', 'tsx'].includes(ext)) {
+          items.push({ name: rel, text: await f.text() });
+        } else if (IMAGE_MIME[ext]) {
+          items.push({ name: rel, dataUrl: await fileToDataUrl(f) });
+        }
+      }
+      await buildBundle(items, 'Folder upload');
+    } catch {
+      setImportNote('Could not read that folder.');
+    }
+  };
+
+  /* ---------------- v0.3 import: convert + apply ----------------
+     One setScene call per import => exactly one undo snapshot, so a
+     single Ctrl+Z reverts the whole import (history effect above). */
+  const runImport = async (mode: 'replace' | 'append') => {
+    if (importBusy) return;
+    const bundle = bundleRef.current;
+    let markup = '';
+    let format: 'html' | 'jsx' = 'html';
+    let assets: Record<string, string> = {};
+    let cssTexts: string[] = [];
+    let label = 'pasted code';
+    if (bundle) {
+      markup = bundle.entry;
+      format = bundle.format;
+      assets = bundle.assets;
+      cssTexts = bundle.cssTexts;
+      label = bundle.label;
+    } else {
+      markup = importText;
+      format = detectFormat(markup);
+    }
+    if (!markup.trim()) {
+      setImportNote('Paste some HTML/JSX code, or upload a file, folder or zip first.');
+      return;
+    }
+    setImportBusy(true);
+    setImportNote('Converting… the page is rendered off-screen for a moment so it can be measured.');
+    const iframe = document.createElement('iframe');
+    try {
+      const htmlMarkup = format === 'jsx' ? jsxToHtml(markup) : markup;
+      const useTailwind = hasTailwindClasses(htmlMarkup);
+      const docHtml = buildImportDocument(htmlMarkup, cssTexts, useTailwind);
+
+      iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
+      iframe.style.cssText = `position:absolute;left:-10000px;top:0;width:${IMPORT_RENDER_WIDTH}px;height:600px;border:0;visibility:hidden;`;
+      const loaded = new Promise<void>((resolve) => {
+        iframe.onload = () => resolve();
+        window.setTimeout(resolve, 6000);
+      });
+      iframe.srcdoc = docHtml;
+      document.body.appendChild(iframe);
+      await loaded;
+      const win = iframe.contentWindow;
+      const idoc = iframe.contentDocument;
+      if (!win || !idoc || !idoc.body) throw new Error('the sandboxed render was blocked');
+
+      // Folder/zip images: swap relative <img src> for uploaded data URLs
+      // BEFORE measuring, so image boxes use the real pictures.
+      if (Object.keys(assets).length > 0) {
+        idoc.querySelectorAll('img').forEach((img) => {
+          const raw = img.getAttribute('src') || '';
+          const resolved = resolveAssetSrc(raw, assets);
+          if (resolved && resolved !== raw) img.setAttribute('src', resolved);
+        });
+      }
+
+      // Tailwind Play CDN: give it a bounded moment to generate utilities,
+      // then continue regardless (offline => inline/computed styles only).
+      if (useTailwind) {
+        const t0 = Date.now();
+        while (Date.now() - t0 < 1800) {
+          if ((win as any).tailwind) break;
+          await new Promise((r) => setTimeout(r, 120));
+        }
+        await new Promise((r) => setTimeout(r, 350));
+      }
+
+      // Let images settle (bounded) so their boxes are final.
+      const imgs = Array.from(idoc.images || []);
+      await Promise.race([
+        Promise.all(
+          imgs.map((im) =>
+            im.complete
+              ? Promise.resolve()
+              : new Promise<void>((res) => {
+                  im.onload = () => res();
+                  im.onerror = () => res();
+                })
+          )
+        ),
+        new Promise((r) => setTimeout(r, 1500)),
+      ]);
+
+      // Grow the iframe to the full page height so element rects map to
+      // % of the whole page (the stage then represents the full page).
+      const fullH = Math.max(idoc.documentElement.scrollHeight || 0, idoc.body?.scrollHeight || 0);
+      if (fullH > 0) iframe.style.height = `${fullH}px`;
+      await new Promise((r) => requestAnimationFrame(() => r(null)));
+
+      const { candidates, skipped: domSkipped, pageWidth, pageHeight } = extractCandidatesFromDoc(idoc, win);
+      const fontScale = (stageRef.current?.clientWidth || IMPORT_RENDER_WIDTH) / IMPORT_RENDER_WIDTH;
+      const { specs, skipped: mapSkipped, truncated } = candidatesToSpecs(candidates, {
+        width: pageWidth,
+        height: pageHeight,
+        fontScale,
+      });
+      const els = specs.map((sp) => createElement(sp.type, sp.fields));
+      const skipped = domSkipped + mapSkipped;
+      if (els.length === 0) {
+        setImportNote(
+          'Nothing could be converted. Import works best on markup-based landing pages — pages built almost entirely from scripts, canvas or SVG have nothing to measure.'
+        );
+        return;
+      }
+      if (mode === 'replace') setScene((s) => ({ ...s, elements: els }));
+      else setScene((s) => ({ ...s, elements: [...s.elements, ...els] }));
+      setSelectedIds(els.map((el) => el.id));
+      setShowImport(false);
+      setStatus(
+        `Imported ${els.length} element(s) from ${label}${mode === 'append' ? ' (added to the current page)' : ''}.` +
+          (skipped > 0 ? ` ${skipped} item(s) couldn't be converted and were skipped.` : '') +
+          (truncated ? ` Stopped at the ${IMPORT_CAP}-element import cap — the page was large.` : '') +
+          ' One Ctrl+Z undoes the whole import.'
+      );
+    } catch (err) {
+      setImportNote(
+        `Import failed (${err instanceof Error ? err.message : 'unknown error'}). Your current page was not changed.`
+      );
+    } finally {
+      iframe.remove();
+      setImportBusy(false);
+    }
+  };
+
   /* ---------------- AI generation ---------------- */
   const generate = async () => {
     const prompt = aiPrompt.trim();
@@ -852,7 +1245,7 @@ export default function App() {
       {/* ---------- top bar ---------- */}
       <header className="panel flex items-center gap-3 px-4 py-2 border-b flex-wrap">
         <div className="font-bold text-lg" style={{ color: '#a78bfa' }}>Scenetics</div>
-        <span className="muted text-xs">v0.2</span>
+        <span className="muted text-xs">v0.3</span>
         <span className="muted text-xs hidden md:inline">Scenes that move — drag, scroll-animate, export real code.</span>
         <div className="flex-1" />
         <button className="btn" onClick={undo} disabled={past.length === 0} title="Ctrl/Cmd+Z">↩ Undo</button>
@@ -863,6 +1256,7 @@ export default function App() {
           className="input" style={{ width: 90 }} />
         <button className="btn" onClick={save}>Save</button>
         <button className="btn" onClick={loadLocal}>Load</button>
+        <button className="btn btn-accent" onClick={() => setShowImport(true)} title="Import an existing landing page (HTML / JSX / folder / zip) as editable elements">⇩ Import</button>
         <a className="btn" href={`${API}/auth/google`} title="Google sign-in (server OAuth — skeleton in MVP)">Login with Google</a>
         <button className="btn" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>
           {theme === 'dark' ? '☀ Light' : '🌙 Dark'}
@@ -1232,6 +1626,89 @@ export default function App() {
           )}
         </aside>
       </div>
+
+      {/* ---------- v0.3 import modal ---------- */}
+      {showImport && (
+        <div
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 60, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+          onPointerDown={() => { if (!importBusy) setShowImport(false); }}
+        >
+          <div
+            className="panel"
+            style={{ width: 660, maxWidth: '94vw', maxHeight: '90vh', overflowY: 'auto', borderRadius: 12, padding: 18 }}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-2">
+              <div className="font-semibold">Import an existing landing page</div>
+              <button className="btn" disabled={importBusy} onClick={() => setShowImport(false)}>✕</button>
+            </div>
+            <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>
+              Paste HTML or React JSX, or upload a file, a whole folder, or a .zip. The page is rendered
+              off-screen, measured, and converted into normal Scenetics elements you can drag, resize,
+              keyframe and export. Best with static, markup-based landing pages.
+            </p>
+
+            <label className="lbl">Paste code (HTML or JSX)</label>
+            <textarea
+              className="input"
+              rows={8}
+              value={importText}
+              placeholder={'<section class="hero">…</section>  —  or a React component with className / style={{…}}'}
+              onChange={(e) => {
+                setImportText(e.target.value);
+                bundleRef.current = null;
+                setImportSourceLabel('');
+                setImportNote('');
+              }}
+              style={{ fontFamily: 'monospace', fontSize: 12 }}
+            />
+
+            <div className="flex gap-2 flex-wrap mt-3">
+              <label className="btn" style={{ cursor: 'pointer' }}>
+                Upload file (.html / .jsx / .tsx)
+                <input type="file" accept=".html,.htm,.jsx,.tsx,.txt" style={{ display: 'none' }} onChange={onImportFile} />
+              </label>
+              <label className="btn" style={{ cursor: 'pointer' }}>
+                Upload folder
+                <input
+                  type="file"
+                  multiple
+                  style={{ display: 'none' }}
+                  onChange={onImportFolder}
+                  ref={(el) => {
+                    if (el) {
+                      el.setAttribute('webkitdirectory', '');
+                      el.setAttribute('directory', '');
+                    }
+                  }}
+                />
+              </label>
+              <label className="btn" style={{ cursor: 'pointer' }}>
+                Upload .zip
+                <input type="file" accept=".zip,application/zip" style={{ display: 'none' }} onChange={onImportZip} />
+              </label>
+            </div>
+            {importSourceLabel && (
+              <p style={{ fontSize: 12, color: '#a78bfa', marginBottom: 0 }}>Source: {importSourceLabel}</p>
+            )}
+            {importNote && <p className="muted" style={{ fontSize: 12 }}>{importNote}</p>}
+
+            <div className="flex gap-2 mt-3">
+              <button className="btn btn-accent" style={{ flex: 1 }} disabled={importBusy} onClick={() => runImport('replace')}>
+                {importBusy ? 'Converting…' : 'Import — replace current page'}
+              </button>
+              <button className="btn" style={{ flex: 1 }} disabled={importBusy} onClick={() => runImport('append')}>
+                {importBusy ? 'Converting…' : 'Import — add to current page'}
+              </button>
+            </div>
+            <p className="muted" style={{ fontSize: 11, marginBottom: 0 }}>
+              Limits: at most {IMPORT_CAP} elements per import; scripts, SVG, canvas, video and iframes can't be
+              converted and are skipped (you'll get a count). Imported layout is proportional — positions and
+              sizes are % of the rendered page. One Ctrl+Z undoes the whole import.
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
