@@ -99,7 +99,7 @@ npm run build        # type-check + production build
 | `PORT` | API port (default 4000) |
 | `MONGODB_URI` | Mongo connection string. Server starts without it; `/api/projects` returns 503 until set. |
 | `XAI_API_KEY` | Grok (xAI) key. Without it, `POST /api/ai/generate` returns 501 and the client uses its local fallback generator. |
-| `XAI_MODEL` | Grok model name — **set this to a current xAI model**; the in-code placeholder (`grok-beta`) may be retired. |
+| `XAI_MODEL` | Grok model name — default `grok-build-0.1` (xAI's coding model, cheapest; good fit for generating component JSON). Alternatives: `grok-4.7` (flagship), `grok-4.5`, `grok-4.20`, `grok-4.3`. Line-up checked Oct 2026. |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth credentials. |
 | `SESSION_SECRET` | Session signing secret (for when auth is fully wired). |
 | `CLIENT_ORIGIN` | Client origin for CORS / redirects (default `http://localhost:5173`). |
@@ -126,4 +126,4 @@ npm run build        # type-check + production build
 - Full-project zip download / GitHub push on export
 - Layout compilation of positioned groups into Flex/Grid wrappers (constraint 1's advanced step) beyond percentage anchoring
 - More export targets (plain HTML/CSS, Vue), multi-page sites, dashboards
-- Domain/trademark check for the name "Scenetics"
+- Domain/trademark check for the name "Scenetics" — preliminary web check 2026-10-23: no exact-match company or product found (only near-miss names like Synectics/Sentics/Scenics in unrelated industries). This is **not** a formal trademark clearance — get proper clearance before commercial launch.

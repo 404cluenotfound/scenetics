@@ -12,9 +12,10 @@ export const aiRouter = Router();
  * If XAI_API_KEY is not set, returns 501 — the client then falls back to
  * its built-in local generator, so the editor still works standalone.
  *
- * NOTE: XAI_MODEL comes from the environment. The placeholder default
- * below ('grok-beta') may not be a current model name — set XAI_MODEL in
- * server/.env to a current Grok model before relying on live AI.
+ * NOTE: XAI_MODEL comes from the environment. The default below is a current
+ * xAI model as of Oct 2026 — set XAI_MODEL in server/.env to pin a specific
+ * one. Current options: 'grok-build-0.1' (coding model, cheapest),
+ * 'grok-4.7' (flagship), 'grok-4.5' / 'grok-4.20' / 'grok-4.3' (mid tier).
  */
 const SYSTEM_PROMPT = `You are Scenetics' component generator. Reply with ONLY valid JSON, no markdown, no commentary.
 Shape: {"elements": [ELEMENT, ...]} — generate 1 to 4 elements.
@@ -54,7 +55,7 @@ aiRouter.post('/generate', async (req, res) => {
   const prompt = (req.body && req.body.prompt) || '';
   if (!prompt.trim()) return res.status(400).json({ error: 'prompt is required' });
 
-  const model = process.env.XAI_MODEL || 'grok-beta'; // placeholder — set XAI_MODEL in .env
+  const model = process.env.XAI_MODEL || 'grok-build-0.1'; // xAI coding model; set XAI_MODEL in .env to change
   try {
     const response = await fetch('https://api.x.ai/v1/chat/completions', {
       method: 'POST',
